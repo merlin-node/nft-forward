@@ -681,6 +681,72 @@ show_status() {
     echo ""
 }
 
+# ============ 在线更新 ============
+REPO_URL="https://github.com/merlin-node/nft-forward/archive/refs/heads/main.zip"
+
+self_update() {
+    echo ""
+    info "===== 在线更新 nft-forward ====="
+    echo ""
+    echo "将从 GitHub 拉取最新版本并重新安装:"
+    echo "  $REPO_URL"
+    echo ""
+    info "你的规则和设置不会被覆盖"
+    echo ""
+    if ! confirm_yn "确认更新?"; then
+        info "已取消"
+        return
+    fi
+
+    # 检查依赖
+    if ! command -v wget >/dev/null 2>&1; then
+        err "未安装 wget,正在安装..."
+        apt-get install -y wget || { err "wget 安装失败"; return 1; }
+    fi
+    if ! command -v unzip >/dev/null 2>&1; then
+        err "未安装 unzip,正在安装..."
+        apt-get install -y unzip || { err "unzip 安装失败"; return 1; }
+    fi
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    cd "$tmpdir" || { err "无法进入临时目录"; return 1; }
+
+    msg "下载最新版本..."
+    if ! wget -q --show-progress "$REPO_URL" -O update.zip; then
+        err "下载失败,请检查网络"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    msg "解压..."
+    if ! unzip -q update.zip; then
+        err "解压失败"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    local pkgdir
+    pkgdir=$(find "$tmpdir" -maxdepth 1 -type d -name "nft-forward-*" | head -1)
+    if [[ -z "$pkgdir" ]] || [[ ! -f "$pkgdir/install.sh" ]]; then
+        err "压缩包结构异常,找不到 install.sh"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    msg "运行安装脚本..."
+    cd "$pkgdir"
+    bash install.sh
+
+    msg "清理临时文件..."
+    rm -rf "$tmpdir"
+
+    echo ""
+    msg "更新完成,重新进入菜单..."
+    sleep 2
+    exec /usr/local/bin/nft-forward
+}
+
 # ============ 一键卸载 ============
 self_uninstall() {
     echo ""
@@ -766,6 +832,7 @@ menu() {
         echo "  7) 查看状态"
         echo "  8) 查看日志(最后20行)"
         echo "  9) 卸载本脚本"
+        echo " 10) 在线更新脚本"
         echo "  0) 退出脚本"
         echo "----------------------------------------"
         local c
@@ -780,6 +847,7 @@ menu() {
             7) show_status; pause ;;
             8) tail -20 "$LOG_FILE"; pause ;;
             9) self_uninstall ;;
+            10) self_update ;;
             0) echo ""; msg "再见"; exit 0 ;;
             *) warn "无效选择"; sleep 1 ;;
         esac
