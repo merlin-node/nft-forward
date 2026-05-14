@@ -7,11 +7,26 @@ set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 msg()  { echo -e "${GREEN}[*]${NC} $*"; }
 warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[x]${NC} $*"; }
+
+# 自适应分割线
+term_width() {
+    local w
+    w=$(tput cols 2>/dev/null || echo 60)
+    (( w < 40 )) && w=40
+    (( w > 80 )) && w=80
+    echo "$w"
+}
+hr() {
+    local color="${1:-$GREEN}" w
+    w=$(term_width)
+    printf "${color}%${w}s${NC}\n" '' | tr ' ' '='
+}
 
 if [[ $EUID -ne 0 ]]; then
     err "需要 root 权限,请用 sudo 运行"
@@ -90,7 +105,20 @@ Unit=nft-forward-ddns.service
 WantedBy=timers.target
 EOF
 
-msg "5/5 启用服务..."
+msg "5/6 安装日志轮转配置..."
+cat > /etc/logrotate.d/nft-forward <<'EOF'
+/var/log/nft-forward.log {
+    size 10M
+    rotate 3
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF
+
+msg "6/6 启用服务..."
 systemctl daemon-reload
 systemctl enable nft-forward.service >/dev/null 2>&1
 systemctl enable nft-forward-ddns.timer >/dev/null 2>&1
@@ -100,12 +128,12 @@ systemctl start nft-forward-ddns.timer
 systemctl enable nftables.service >/dev/null 2>&1 || true
 
 echo ""
-msg "========================================="
-msg "  安装完成!"
-msg "========================================="
+hr "$GREEN"
+echo -e "${GREEN}  安装完成!${NC}"
+hr "$GREEN"
 echo ""
-echo "  使用方法: 输入 ${GREEN}zf${NC} 回车进入菜单"
-echo "             也可以输入 ${GREEN}nft-forward${NC} (完整命令名)"
+echo -e "  使用方法: 输入 ${GREEN}zf${NC} 回车进入菜单"
+echo -e "             也可以输入 ${GREEN}nft-forward${NC} (完整命令名)"
 echo ""
 echo "  常用命令:"
 echo "    zf                  # 交互菜单"

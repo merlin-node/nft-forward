@@ -31,6 +31,47 @@ warn() { echo -e "${YELLOW}[!]${NC} $*"; }
 err()  { echo -e "${RED}[x]${NC} $*"; }
 info() { echo -e "${CYAN}[i]${NC} $*"; }
 
+# 自适应终端宽度,40-80 之间
+term_width() {
+    local w
+    w=$(tput cols 2>/dev/null || echo 60)
+    (( w < 40 )) && w=40
+    (( w > 80 )) && w=80
+    echo "$w"
+}
+
+# 普通分割线,默认蓝色,可传颜色变量
+hr() {
+    local color="${1:-$BLUE}" w
+    w=$(term_width)
+    printf "${color}%${w}s${NC}\n" '' | tr ' ' '='
+}
+
+# 带标题的居中分割线,中文按宽度 2 计
+hr_title() {
+    local title="$1" color="${2:-$BLUE}" w side_eq
+    w=$(term_width)
+    local bytes chars non_ascii_chars ascii_chars visual
+    bytes=$(printf '%s' " ${title} " | wc -c)
+    chars=$(printf '%s' " ${title} " | wc -m)
+    non_ascii_chars=$(( (bytes - chars) / 2 ))
+    ascii_chars=$(( chars - non_ascii_chars ))
+    visual=$(( ascii_chars + non_ascii_chars * 2 ))
+    side_eq=$(( (w - visual) / 2 ))
+    (( side_eq < 3 )) && side_eq=3
+    local left right
+    left=$(printf "%${side_eq}s" '' | tr ' ' '=')
+    right=$(printf "%${side_eq}s" '' | tr ' ' '=')
+    echo -e "${color}${left} ${title} ${right}${NC}"
+}
+
+# 细分割线(破折号),用于菜单内部分隔
+hr_thin() {
+    local color="${1:-$BLUE}" w
+    w=$(term_width)
+    printf "${color}%${w}s${NC}\n" '' | tr ' ' '-'
+}
+
 need_root() {
     if [[ $EUID -ne 0 ]]; then
         err "需要 root 权限,请用 sudo 运行"
@@ -152,9 +193,9 @@ next_id() {
 list_rules() {
     echo ""
     info "当前转发规则:"
-    echo "----------------------------------------------------------------------"
+    hr_thin
     printf "%-4s %-8s %-8s %-30s %-8s %s\n" "ID" "协议" "本机端口" "目标地址" "目标端口" "备注"
-    echo "----------------------------------------------------------------------"
+    hr_thin
     local count=0
     while IFS='|' read -r id proto lport target rport atype note; do
         [[ "$id" =~ ^[0-9]+$ ]] || continue
@@ -167,7 +208,7 @@ list_rules() {
         printf "%-4s %-8s %-8s %-30s %-8s %s\n" "$id" "$proto" "$lport" "$disp" "$rport" "${note:--}"
         count=$((count + 1))
     done < "$RULES_FILE"
-    echo "----------------------------------------------------------------------"
+    hr_thin
     echo "共 $count 条规则"
     echo ""
 }
@@ -409,6 +450,7 @@ EOF
             dest_ip=$(resolve_domain_v4 "$target")
             if [[ -z "$dest_ip" ]]; then
                 warn "规则 ID=$id 域名 $target 解析失败,本次跳过"
+                log "RESOLVE failed v4: rule id=$id domain=$target"
                 continue
             fi
         fi
@@ -461,7 +503,10 @@ EOF
             [[ "$atype" == "ip" ]] && continue
             local dest_ip6
             dest_ip6=$(resolve_domain_v6 "$target")
-            [[ -z "$dest_ip6" ]] && continue
+            if [[ -z "$dest_ip6" ]]; then
+                log "RESOLVE failed v6: rule id=$id domain=$target"
+                continue
+            fi
             if [[ "$proto" == "tcpudp" ]]; then
                 echo "        tcp dport $lport dnat to [$dest_ip6]:$rport" >> "$tmp"
                 echo "        udp dport $lport dnat to [$dest_ip6]:$rport" >> "$tmp"
@@ -635,16 +680,16 @@ settings_menu() {
     while true; do
         load_settings
         clear
-        echo -e "${BLUE}========================================${NC}"
-        echo -e "${BLUE}    设置${NC}"
-        echo -e "${BLUE}========================================${NC}"
+        hr
+        hr_title "设置"
+        hr
         echo "  当前 IPv6 转发:    $IPV6_ENABLED"
         echo "  当前 DDNS 间隔:    ${DDNS_INTERVAL_MIN} 分钟"
-        echo "----------------------------------------"
+        hr_thin
         echo "  1) 切换 IPv6 开关"
         echo "  2) 修改 DDNS 检查间隔"
         echo "  0) 返回上级"
-        echo "----------------------------------------"
+        hr_thin
         local c
         read -rp "选择: " c
         case "$c" in
@@ -686,7 +731,7 @@ REPO_URL="https://github.com/merlin-node/nft-forward/archive/refs/heads/main.zip
 
 self_update() {
     echo ""
-    info "===== 在线更新 nft-forward ====="
+    hr_title "在线更新 nft-forward" "$CYAN"
     echo ""
     echo "将从 GitHub 拉取最新版本并重新安装:"
     echo "  $REPO_URL"
@@ -750,7 +795,7 @@ self_update() {
 # ============ 一键卸载 ============
 self_uninstall() {
     echo ""
-    warn "===== 一键卸载 nft-forward ====="
+    hr_title "一键卸载 nft-forward" "$YELLOW"
     echo ""
     echo "将执行以下操作:"
     echo "  1. 停止并禁用 systemd 服务(开机自启、DDNS定时器)"
@@ -788,6 +833,7 @@ self_uninstall() {
     rm -f /etc/systemd/system/nft-forward.service
     rm -f /etc/systemd/system/nft-forward-ddns.service
     rm -f /etc/systemd/system/nft-forward-ddns.timer
+    rm -f /etc/logrotate.d/nft-forward
     rm -f /usr/local/bin/zf
     rm -f "$NFT_FILE"
     rm -f /etc/sysctl.d/99-nft-forward.conf
@@ -795,7 +841,7 @@ self_uninstall() {
 
     if [[ "$keep_conf" != "y" ]]; then
         rm -rf "$CONF_DIR"
-        rm -f "$LOG_FILE"
+        rm -f "$LOG_FILE" "${LOG_FILE}".*
         msg "配置和日志已删除"
     else
         msg "已保留 $CONF_DIR 和 $LOG_FILE"
@@ -806,9 +852,9 @@ self_uninstall() {
     rm -f /usr/local/bin/nft-forward
 
     echo ""
-    msg "========================================="
-    msg "  卸载完成,再见!"
-    msg "========================================="
+    hr "$GREEN"
+    echo -e "${GREEN}  卸载完成,再见!${NC}"
+    hr "$GREEN"
     echo ""
     exit 0
 }
@@ -818,11 +864,11 @@ menu() {
     while true; do
         clear
         load_settings
-        echo -e "${BLUE}========================================${NC}"
-        echo -e "${BLUE}    nft-forward 中转管理${NC}"
-        echo -e "${BLUE}========================================${NC}"
+        hr
+        hr_title "nft-forward 中转管理"
+        hr
         echo "  IPv6: $IPV6_ENABLED   DDNS间隔: ${DDNS_INTERVAL_MIN}分钟"
-        echo "----------------------------------------"
+        hr_thin
         echo "  1) 查看规则"
         echo "  2) 添加规则"
         echo "  3) 删除规则"
@@ -834,7 +880,7 @@ menu() {
         echo "  9) 卸载本脚本"
         echo " 10) 在线更新脚本"
         echo "  0) 退出脚本"
-        echo "----------------------------------------"
+        hr_thin
         local c
         read -rp "选择: " c
         case "$c" in
