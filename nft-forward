@@ -190,6 +190,20 @@ next_id() {
     echo $((max + 1))
 }
 
+# 重新编号:按文件中的顺序把规则 ID 重排为 1,2,3...
+renumber_rules() {
+    local tmp
+    tmp=$(mktemp)
+    awk -F'|' 'BEGIN{OFS="|"; n=0}
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ {print; next}
+        $1 ~ /^[0-9]+$/ {n++; $1=n; print; next}
+        {print}' "$RULES_FILE" > "$tmp"
+    mv "$tmp" "$RULES_FILE"
+    chmod 600 "$RULES_FILE"
+    # DDNS 缓存按 ID 记录,编号变了就清掉,下次检查时自动重建
+    rm -f "$CONF_DIR/.ddns_cache"
+}
+
 list_rules() {
     echo ""
     info "当前转发规则:"
@@ -408,6 +422,7 @@ del_rule() {
         done
         mv "$tmp" "$RULES_FILE"
         chmod 600 "$RULES_FILE"
+        renumber_rules
         apply_rules
         return
     done
