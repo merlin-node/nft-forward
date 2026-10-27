@@ -466,6 +466,8 @@ EOF
             if [[ -z "$dest_ip" ]]; then
                 warn "规则 ID=$id 域名 $target 解析失败,本次跳过"
                 log "RESOLVE failed v4: rule id=$id domain=$target"
+                # 清掉缓存,保证下次 DDNS 检查一定会重新应用
+                sed -i "/^$id:v4:/d" "$CONF_DIR/.ddns_cache" 2>/dev/null
                 continue
             fi
         fi
@@ -609,7 +611,11 @@ ddns_update() {
         if [[ -n "$new_ip" ]]; then
             local old_ip
             old_ip=$(grep "^$id:v4:" "$state_file" | cut -d: -f3)
-            if [[ "$new_ip" != "$old_ip" ]]; then
+            # 缓存一致但内核里没有这条 dnat(开机解析失败被跳过、表被清掉等),也要重载
+            local live_ok=1
+            nft list chain ip $TABLE4 prerouting 2>/dev/null | grep -qF "dnat to $new_ip:$rport" || live_ok=0
+            if [[ "$new_ip" != "$old_ip" ]] || [[ "$live_ok" == "0" ]]; then
+                [[ "$live_ok" == "0" ]] && log "DDNS rule=$id $target v4: $new_ip 未在 nft 中生效,重新应用"
                 sed -i "/^$id:v4:/d" "$state_file"
                 echo "$id:v4:$new_ip" >> "$state_file"
                 need_reload=1
