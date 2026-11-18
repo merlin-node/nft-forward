@@ -13,6 +13,17 @@ LOG_FILE="/var/log/nft-forward.log"
 TABLE4="nft_forward"
 TABLE6="nft_forward6"
 
+# realm(用户态转发)
+REALM_BIN="/usr/local/bin/realm"
+REALM_CONF="$CONF_DIR/realm.toml"
+REALM_UNIT="nft-forward-realm"
+REALM_UNIT_FILE="/etc/systemd/system/${REALM_UNIT}.service"
+REALM_FALLBACK_VER="v2.9.1"
+
+# 在线更新源
+RAW_BASE="https://raw.githubusercontent.com/merlin-node/nft-forward/main"
+GH_MIRRORS=("" "https://ghproxy.net/" "https://gh-proxy.com/")
+
 # ============ 颜色 ============
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -92,6 +103,38 @@ pause() {
     read -rp "按回车返回..." _
 }
 
+# HTTP 下载到 stdout,curl 优先,没有就用 wget
+http_get() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 180 "$1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- -T 15 -t 2 "$1"
+    else
+        err "curl 和 wget 都没有,请先 apt install -y curl"
+        return 1
+    fi
+}
+
+# 规则的转发引擎,老规则没有第 8 列,默认 nft
+rule_engine() { [[ "$1" == "realm" ]] && echo realm || echo nft; }
+
+# 协议展开成 nft 的 L4 关键字
+proto_l4() {
+    case "$1" in
+        tcpudp) echo "tcp udp" ;;
+        udp)    echo "udp" ;;
+        *)      echo "tcp" ;;
+    esac
+}
+
+proto_label() {
+    case "$1" in
+        tcpudp) echo "TCP+UDP" ;;
+        udp)    echo "UDP" ;;
+        *)      echo "TCP" ;;
+    esac
+}
+
 # ============ 初始化 ============
 init_files() {
     mkdir -p "$CONF_DIR"
@@ -101,9 +144,10 @@ init_files() {
     if [[ ! -f "$RULES_FILE" ]]; then
         cat > "$RULES_FILE" <<'EOF'
 # nft-forward 规则配置文件
-# 格式: ID|协议|本机端口|目标地址|目标端口|地址类型|备注
-# 协议: tcp / tcpudp
+# 格式: ID|协议|本机端口|目标地址|目标端口|地址类型|备注|引擎
+# 协议: tcp / udp / tcpudp
 # 地址类型: ip / domain
+# 引擎: nft / realm (留空视为 nft)
 EOF
         chmod 600 "$RULES_FILE"
     fi
@@ -204,22 +248,28 @@ renumber_rules() {
     rm -f "$CONF_DIR/.ddns_cache"
 }
 
+# 参数: 空=全部, nft / realm=只看该引擎
 list_rules() {
+    local only="${1:-}"
+    local title="全部"
+    [[ "$only" == "nft" ]] && title="nftables"
+    [[ "$only" == "realm" ]] && title="realm"
     echo ""
-    info "当前转发规则:"
+    info "当前 $title 转发规则:"
     hr_thin
-    printf "%-4s %-8s %-8s %-30s %-8s %s\n" "ID" "协议" "本机端口" "目标地址" "目标端口" "备注"
+    printf "%-4s %-6s %-8s %-8s %-30s %-8s %s\n" "ID" "引擎" "协议" "本机端口" "目标地址" "目标端口" "备注"
     hr_thin
-    local count=0
-    while IFS='|' read -r id proto lport target rport atype note; do
+    local count=0 id proto lport target rport atype note engine
+    while IFS='|' read -r id proto lport target rport atype note engine; do
         [[ "$id" =~ ^[0-9]+$ ]] || continue
+        [[ -z "$only" || "$(rule_engine "$engine")" == "$only" ]] || continue
         local disp="$target"
         if [[ "$atype" == "domain" ]]; then
             local resolved
             resolved=$(resolve_domain_v4 "$target")
             disp="$target(→${resolved:-未解析})"
         fi
-        printf "%-4s %-8s %-8s %-30s %-8s %s\n" "$id" "$proto" "$lport" "$disp" "$rport" "${note:--}"
+        printf "%-4s %-6s %-8s %-8s %-30s %-8s %s\n" "$id" "$(rule_engine "$engine")" "$(proto_label "$proto")" "$lport" "$disp" "$rport" "${note:--}"
         count=$((count + 1))
     done < "$RULES_FILE"
     hr_thin
@@ -228,22 +278,39 @@ list_rules() {
 }
 
 # ============ 添加规则(全数字交互)============
+# 参数: nft / realm
 add_rule() {
+    local engine="${1:-nft}"
     echo ""
-    info "添加转发规则(任意步骤输入 0 取消)"
+    if [[ "$engine" == "realm" ]]; then
+        info "添加 realm 转发规则(任意步骤输入 0 取消)"
+    else
+        info "添加 nftables 转发规则(任意步骤输入 0 取消)"
+    fi
     echo ""
+
+    if [[ "$engine" == "realm" ]] && [[ ! -x "$REALM_BIN" ]]; then
+        warn "realm 还没安装"
+        if confirm_yn "现在安装?"; then
+            realm_install || return
+        else
+            info "已取消"; return
+        fi
+    fi
 
     # 协议
     echo "选择协议:"
     echo "  1) TCP + UDP"
     echo "  2) 仅 TCP"
+    echo "  3) 仅 UDP"
     echo "  0) 取消返回"
     local p proto
-    read -rp "请选择 [0-2]: " p
+    read -rp "请选择 [0-3]: " p
     case "$p" in
         0) info "已取消"; return ;;
         1) proto="tcpudp" ;;
         2) proto="tcp" ;;
+        3) proto="udp" ;;
         *) err "无效选择"; return ;;
     esac
 
@@ -276,7 +343,11 @@ add_rule() {
     echo ""
     echo "目标地址类型:"
     echo "  1) IP 地址(固定IP)"
-    echo "  2) 域名(动态IP,自动定时更新)"
+    if [[ "$engine" == "realm" ]]; then
+        echo "  2) 域名(由 realm 实时解析)"
+    else
+        echo "  2) 域名(动态IP,自动定时更新)"
+    fi
     echo "  0) 取消返回"
     local t atype target
     read -rp "请选择 [0-2]: " t
@@ -284,10 +355,14 @@ add_rule() {
         0) info "已取消"; return ;;
         1)
             atype="ip"
+            local ip_hint="IPv4"
+            [[ "$engine" == "realm" ]] && ip_hint="IPv4/IPv6"
             while true; do
-                read -rp "目标 IPv4 地址 (输入 0 取消): " target
+                read -rp "目标 $ip_hint 地址 (输入 0 取消): " target
                 [[ "$target" == "0" ]] && { info "已取消"; return; }
+                target="${target#[}"; target="${target%]}"
                 if is_valid_ipv4 "$target"; then break; fi
+                if [[ "$engine" == "realm" ]] && is_valid_ipv6 "$target"; then break; fi
                 err "IP 格式无效"
             done
             ;;
@@ -334,7 +409,8 @@ add_rule() {
     # 最终确认
     echo ""
     info "规则预览:"
-    echo "  协议:     $proto"
+    echo "  引擎:     $engine"
+    echo "  协议:     $(proto_label "$proto")"
     echo "  本机端口: $lport"
     echo "  目标:     $target:$rport ($atype)"
     echo "  备注:     ${note:--}"
@@ -346,39 +422,47 @@ add_rule() {
 
     local id
     id=$(next_id)
-    echo "$id|$proto|$lport|$target|$rport|$atype|$note" >> "$RULES_FILE"
+    echo "$id|$proto|$lport|$target|$rport|$atype|$note|$engine" >> "$RULES_FILE"
     msg "规则已添加 (ID=$id)"
-    log "ADD rule id=$id $proto $lport -> $target:$rport ($atype) note=$note"
+    log "ADD rule id=$id [$engine] $proto $lport -> $target:$rport ($atype) note=$note"
 
-    apply_rules
+    apply_engine "$engine"
 }
 
 # ============ 删除规则(带 y/n 确认)============
+# 参数: nft / realm,只能删该引擎的规则
 del_rule() {
+    local engine="${1:-nft}"
+    local label="nftables"
+    [[ "$engine" == "realm" ]] && label="realm"
     while true; do
-        list_rules
+        list_rules "$engine"
         echo "  0) 返回上级"
         echo ""
-        read -rp "输入要删除的规则 ID(多个空格分隔,输入 all 全部清空,0 返回): " ids
+        read -rp "输入要删除的规则 ID(多个空格分隔,输入 all 清空全部 $label 规则,0 返回): " ids
         if [[ -z "$ids" ]] || [[ "$ids" == "0" ]]; then
             return
         fi
 
         if [[ "$ids" == "all" ]]; then
             echo ""
-            warn "即将清空全部规则!"
+            warn "即将清空全部 $label 规则!(另一种引擎的规则不受影响)"
             if ! confirm_yn "确认清空?"; then
                 info "已取消"
                 continue
             fi
             local tmp
             tmp=$(mktemp)
-            grep -E '^\s*#|^\s*$' "$RULES_FILE" > "$tmp" || true
+            # 保留注释、空行和另一种引擎的规则
+            awk -F'|' -v e="$engine" '
+                $1 !~ /^[0-9]+$/ {print; next}
+                { r = ($8 == "realm") ? "realm" : "nft"; if (r != e) print }' "$RULES_FILE" > "$tmp"
             mv "$tmp" "$RULES_FILE"
             chmod 600 "$RULES_FILE"
-            msg "已清空全部规则"
-            log "DEL all rules"
-            apply_rules
+            renumber_rules
+            msg "已清空全部 $label 规则"
+            log "DEL all $engine rules"
+            apply_engine "$engine"
             return
         fi
 
@@ -390,7 +474,9 @@ del_rule() {
                 invalid+=("$id")
                 continue
             fi
-            if grep -qE "^$id\|" "$RULES_FILE"; then
+            local line
+            line=$(grep -E "^$id\|" "$RULES_FILE" | head -1)
+            if [[ -n "$line" ]] && [[ "$(rule_engine "$(echo "$line" | cut -d'|' -f8)")" == "$engine" ]]; then
                 valid_ids+=("$id")
             else
                 invalid+=("$id")
@@ -398,7 +484,7 @@ del_rule() {
         done
 
         if [[ ${#invalid[@]} -gt 0 ]]; then
-            warn "以下 ID 无效或不存在: ${invalid[*]}"
+            warn "以下 ID 无效或不属于 $label: ${invalid[*]}"
         fi
         if [[ ${#valid_ids[@]} -eq 0 ]]; then
             err "没有有效的 ID 可删除"
@@ -423,7 +509,7 @@ del_rule() {
         mv "$tmp" "$RULES_FILE"
         chmod 600 "$RULES_FILE"
         renumber_rules
-        apply_rules
+        apply_engine "$engine"
         return
     done
 }
@@ -434,30 +520,28 @@ generate_nft() {
     local tmp
     tmp=$(mktemp)
 
-    cat > "$tmp" <<EOF
+    cat > "$tmp" <<EOT
 #!/usr/sbin/nft -f
 # 本文件由 nft-forward 自动生成,请勿手动编辑
 
 table ip $TABLE4
 delete table ip $TABLE4
-EOF
+EOT
 
     if [[ "$v6" == "yes" ]]; then
-        cat >> "$tmp" <<EOF
+        cat >> "$tmp" <<EOT
 table ip6 $TABLE6
 delete table ip6 $TABLE6
-EOF
+EOT
     fi
 
-    cat >> "$tmp" <<EOF
-
-table ip $TABLE4 {
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-EOF
-
-    while IFS='|' read -r id proto lport target rport atype note; do
+    # 先把 nft 规则解析一遍,prerouting/postrouting 共用,避免同一域名解析两次结果不一致
+    local -a pre4=() post4=() pre6=() post6=()
+    local id proto lport target rport atype note engine l4
+    while IFS='|' read -r id proto lport target rport atype note engine; do
         [[ "$id" =~ ^[0-9]+$ ]] || continue
+        [[ "$(rule_engine "$engine")" == "nft" ]] || continue
+
         local dest_ip
         if [[ "$atype" == "ip" ]]; then
             dest_ip="$target"
@@ -468,102 +552,77 @@ EOF
                 log "RESOLVE failed v4: rule id=$id domain=$target"
                 # 清掉缓存,保证下次 DDNS 检查一定会重新应用
                 sed -i "/^$id:v4:/d" "$CONF_DIR/.ddns_cache" 2>/dev/null
-                continue
             fi
         fi
-        if [[ "$proto" == "tcpudp" ]]; then
-            echo "        tcp dport $lport dnat to $dest_ip:$rport" >> "$tmp"
-            echo "        udp dport $lport dnat to $dest_ip:$rport" >> "$tmp"
-        else
-            echo "        tcp dport $lport dnat to $dest_ip:$rport" >> "$tmp"
+        if [[ -n "$dest_ip" ]]; then
+            for l4 in $(proto_l4 "$proto"); do
+                pre4+=("$l4 dport $lport dnat to $dest_ip:$rport")
+                post4+=("ip daddr $dest_ip $l4 dport $rport masquerade")
+            done
         fi
-    done < "$RULES_FILE"
 
-    cat >> "$tmp" <<EOF
-    }
-
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-EOF
-
-    while IFS='|' read -r id proto lport target rport atype note; do
-        [[ "$id" =~ ^[0-9]+$ ]] || continue
-        local dest_ip
-        if [[ "$atype" == "ip" ]]; then
-            dest_ip="$target"
-        else
-            dest_ip=$(resolve_domain_v4 "$target")
-            [[ -z "$dest_ip" ]] && continue
-        fi
-        if [[ "$proto" == "tcpudp" ]]; then
-            echo "        ip daddr $dest_ip tcp dport $rport masquerade" >> "$tmp"
-            echo "        ip daddr $dest_ip udp dport $rport masquerade" >> "$tmp"
-        else
-            echo "        ip daddr $dest_ip tcp dport $rport masquerade" >> "$tmp"
-        fi
-    done < "$RULES_FILE"
-
-    cat >> "$tmp" <<EOF
-    }
-}
-EOF
-
-    if [[ "$v6" == "yes" ]]; then
-        cat >> "$tmp" <<EOF
-
-table ip6 $TABLE6 {
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-EOF
-        while IFS='|' read -r id proto lport target rport atype note; do
-            [[ "$id" =~ ^[0-9]+$ ]] || continue
-            [[ "$atype" == "ip" ]] && continue
+        if [[ "$v6" == "yes" ]] && [[ "$atype" == "domain" ]]; then
             local dest_ip6
             dest_ip6=$(resolve_domain_v6 "$target")
             if [[ -z "$dest_ip6" ]]; then
                 log "RESOLVE failed v6: rule id=$id domain=$target"
-                continue
-            fi
-            if [[ "$proto" == "tcpudp" ]]; then
-                echo "        tcp dport $lport dnat to [$dest_ip6]:$rport" >> "$tmp"
-                echo "        udp dport $lport dnat to [$dest_ip6]:$rport" >> "$tmp"
             else
-                echo "        tcp dport $lport dnat to [$dest_ip6]:$rport" >> "$tmp"
+                for l4 in $(proto_l4 "$proto"); do
+                    pre6+=("$l4 dport $lport dnat to [$dest_ip6]:$rport")
+                    post6+=("ip6 daddr $dest_ip6 $l4 dport $rport masquerade")
+                done
             fi
-        done < "$RULES_FILE"
+        fi
+    done < "$RULES_FILE"
 
-        cat >> "$tmp" <<EOF
-    }
-
-    chain postrouting {
-        type nat hook postrouting priority srcnat; policy accept;
-EOF
-        while IFS='|' read -r id proto lport target rport atype note; do
-            [[ "$id" =~ ^[0-9]+$ ]] || continue
-            [[ "$atype" == "ip" ]] && continue
-            local dest_ip6
-            dest_ip6=$(resolve_domain_v6 "$target")
-            [[ -z "$dest_ip6" ]] && continue
-            if [[ "$proto" == "tcpudp" ]]; then
-                echo "        ip6 daddr $dest_ip6 tcp dport $rport masquerade" >> "$tmp"
-                echo "        ip6 daddr $dest_ip6 udp dport $rport masquerade" >> "$tmp"
-            else
-                echo "        ip6 daddr $dest_ip6 tcp dport $rport masquerade" >> "$tmp"
-            fi
-        done < "$RULES_FILE"
-
-        cat >> "$tmp" <<EOF
-    }
-}
-EOF
-    fi
+    {
+        echo ""
+        echo "table ip $TABLE4 {"
+        echo "    chain prerouting {"
+        echo "        type nat hook prerouting priority dstnat; policy accept;"
+        for l4 in "${pre4[@]}"; do echo "        $l4"; done
+        echo "    }"
+        echo ""
+        echo "    chain postrouting {"
+        echo "        type nat hook postrouting priority srcnat; policy accept;"
+        for l4 in "${post4[@]}"; do echo "        $l4"; done
+        echo "    }"
+        echo "}"
+        if [[ "$v6" == "yes" ]]; then
+            echo ""
+            echo "table ip6 $TABLE6 {"
+            echo "    chain prerouting {"
+            echo "        type nat hook prerouting priority dstnat; policy accept;"
+            for l4 in "${pre6[@]}"; do echo "        $l4"; done
+            echo "    }"
+            echo ""
+            echo "    chain postrouting {"
+            echo "        type nat hook postrouting priority srcnat; policy accept;"
+            for l4 in "${post6[@]}"; do echo "        $l4"; done
+            echo "    }"
+            echo "}"
+        fi
+    } >> "$tmp"
 
     mv "$tmp" "$NFT_FILE"
     chmod 600 "$NFT_FILE"
 }
 
 # ============ 应用规则 ============
+# 只应用某一边:nft / realm
+apply_engine() {
+    if [[ "$1" == "realm" ]]; then apply_realm; else apply_nft; fi
+}
+
+# 两边都应用
 apply_rules() {
+    local rc=0
+    apply_nft || rc=1
+    apply_realm || rc=1
+    return $rc
+}
+
+apply_nft() {
     load_settings
 
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
@@ -581,10 +640,10 @@ EOF
     generate_nft "$IPV6_ENABLED"
 
     nft list table ip $TABLE4 >/dev/null 2>&1 && nft delete table ip $TABLE4 2>/dev/null
-    if [[ "$IPV6_ENABLED" == "yes" ]]; then
-        nft list table ip6 $TABLE6 >/dev/null 2>&1 && nft delete table ip6 $TABLE6 2>/dev/null
-    fi
+    # IPv6 关掉时也要把旧的 v6 表清掉,否则会一直残留生效
+    nft list table ip6 $TABLE6 >/dev/null 2>&1 && nft delete table ip6 $TABLE6 2>/dev/null
 
+    local rc=0
     if nft -f "$NFT_FILE" 2>/tmp/nft-err; then
         msg "nftables 规则已生效"
         log "APPLY ok"
@@ -592,8 +651,260 @@ EOF
         err "应用失败:"
         cat /tmp/nft-err
         log "APPLY failed: $(cat /tmp/nft-err)"
+        rc=1
+    fi
+    return $rc
+}
+
+# ============ realm ============
+realm_rule_count() {
+    awk -F'|' '$1 ~ /^[0-9]+$/ && $8 == "realm" {n++} END {print n+0}' "$RULES_FILE"
+}
+
+realm_version() {
+    [[ -x "$REALM_BIN" ]] || { echo "未安装"; return; }
+    "$REALM_BIN" --version 2>/dev/null | awk '{print $NF; exit}'
+}
+
+realm_state() {
+    systemctl is-active "$REALM_UNIT" 2>/dev/null || true
+}
+
+generate_realm() {
+    local out="$1" listen_host="0.0.0.0"
+    # 有 IPv6 栈就监听 [::],Linux 默认双栈,v4 v6 都能进
+    [[ -f /proc/net/if_inet6 ]] && listen_host="[::]"
+
+    cat > "$out" <<EOF
+# 本文件由 nft-forward 自动生成,请勿手动编辑
+
+[log]
+level = "warn"
+
+[network]
+no_tcp = false
+use_udp = false
+EOF
+
+    local id proto lport target rport atype note engine remote
+    while IFS='|' read -r id proto lport target rport atype note engine; do
+        [[ "$id" =~ ^[0-9]+$ ]] || continue
+        [[ "$engine" == "realm" ]] || continue
+        remote="$target:$rport"
+        is_valid_ipv6 "$target" && remote="[$target]:$rport"
+        {
+            echo ""
+            echo "# ID=$id${note:+ $note}"
+            echo "[[endpoints]]"
+            echo "listen = \"$listen_host:$lport\""
+            echo "remote = \"$remote\""
+            case "$proto" in
+                tcpudp) echo "network = { use_udp = true }" ;;
+                udp)    echo "network = { no_tcp = true, use_udp = true }" ;;
+            esac
+        } >> "$out"
+    done < "$RULES_FILE"
+}
+
+ensure_realm_unit() {
+    local tmp
+    tmp=$(mktemp)
+    cat > "$tmp" <<EOF
+[Unit]
+Description=nft-forward realm relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$REALM_BIN -c $REALM_CONF
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    if ! cmp -s "$tmp" "$REALM_UNIT_FILE"; then
+        mv "$tmp" "$REALM_UNIT_FILE"
+        chmod 644 "$REALM_UNIT_FILE"
+        systemctl daemon-reload
+    else
+        rm -f "$tmp"
+    fi
+}
+
+# 按规则生成 realm 配置;配置没变且服务在跑就不动它,不打断现有连接
+apply_realm() {
+    local n
+    n=$(realm_rule_count)
+
+    if (( n == 0 )); then
+        if [[ -f "$REALM_UNIT_FILE" ]]; then
+            systemctl disable --now --no-block "$REALM_UNIT" >/dev/null 2>&1
+        fi
+        rm -f "$REALM_CONF"
+        return 0
+    fi
+
+    if [[ ! -x "$REALM_BIN" ]]; then
+        warn "有 $n 条 realm 规则,但 realm 未安装(主菜单 8 → 安装)"
+        log "REALM not installed, $n rules skipped"
         return 1
     fi
+
+    ensure_realm_unit
+    local tmp changed=1
+    tmp=$(mktemp)
+    generate_realm "$tmp"
+    cmp -s "$tmp" "$REALM_CONF" && changed=0
+    mv "$tmp" "$REALM_CONF"
+    chmod 600 "$REALM_CONF"
+    systemctl enable "$REALM_UNIT" >/dev/null 2>&1
+
+    local st
+    st=$(realm_state)
+    if (( changed == 0 )) && [[ "$st" == "active" || "$st" == "activating" ]]; then
+        return 0
+    fi
+
+    # 被 systemd 调用(开机 apply)时不能同步等 realm 启动,否则会和 network-online 互相等待
+    if [[ -n "${INVOCATION_ID:-}" ]]; then
+        systemctl --no-block restart "$REALM_UNIT"
+        log "REALM restart queued ($n rules)"
+        return 0
+    fi
+
+    systemctl restart "$REALM_UNIT"
+    sleep 1
+    if [[ "$(realm_state)" == "active" ]]; then
+        msg "realm 规则已生效 ($n 条)"
+        log "REALM apply ok ($n rules)"
+    else
+        err "realm 启动失败,最近日志:"
+        journalctl -u "$REALM_UNIT" -n 15 --no-pager 2>/dev/null
+        log "REALM apply failed"
+        return 1
+    fi
+}
+
+realm_install() {
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64)  arch="x86_64-unknown-linux-gnu" ;;
+        aarch64|arm64) arch="aarch64-unknown-linux-gnu" ;;
+        *) err "不支持的架构: $(uname -m)"; return 1 ;;
+    esac
+
+    msg "查询 realm 最新版本..."
+    local ver
+    ver=$(http_get "https://api.github.com/repos/zhboner/realm/releases/latest" 2>/dev/null \
+        | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -1)
+    if [[ -z "$ver" ]]; then
+        ver="$REALM_FALLBACK_VER"
+        warn "GitHub API 不可用,使用保底版本 $ver"
+    else
+        info "最新版本: $ver"
+    fi
+
+    local cur
+    cur=$(realm_version)
+    if [[ "$cur" != "未安装" ]] && [[ "v${cur#v}" == "$ver" ]]; then
+        info "已是最新版本 ($cur)"
+        return 0
+    fi
+
+    local url="https://github.com/zhboner/realm/releases/download/$ver/realm-$arch.tar.gz"
+    local tmpdir ok=0 m
+    tmpdir=$(mktemp -d)
+    for m in "${GH_MIRRORS[@]}"; do
+        msg "下载: ${m:-GitHub 直连}${m:+ (镜像)}"
+        if http_get "${m}${url}" > "$tmpdir/realm.tgz" 2>/dev/null \
+            && tar -tzf "$tmpdir/realm.tgz" 2>/dev/null | grep -qE '(^|/)realm$'; then
+            ok=1; break
+        fi
+        warn "该源不可用,换下一个..."
+    done
+    if (( ok == 0 )); then
+        err "realm 下载失败,请检查网络"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    tar -xzf "$tmpdir/realm.tgz" -C "$tmpdir"
+    local bin
+    bin=$(find "$tmpdir" -type f -name realm | head -1)
+    if [[ -z "$bin" ]] || ! "$bin" --version >/dev/null 2>&1; then
+        err "解压出的 realm 无法运行"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+    install -m 755 "$bin" "$REALM_BIN"
+    rm -rf "$tmpdir"
+    msg "realm $(realm_version) 已安装到 $REALM_BIN"
+    log "REALM installed $ver"
+
+    ensure_realm_unit
+    # 升级时强制重启,换上新二进制
+    if (( $(realm_rule_count) > 0 )); then
+        rm -f "$REALM_CONF"
+        apply_realm
+    fi
+}
+
+realm_uninstall() {
+    local n
+    n=$(realm_rule_count)
+    echo ""
+    if (( n > 0 )); then
+        warn "当前有 $n 条 realm 规则,卸载后这些规则会失效(规则本身保留)"
+    fi
+    if ! confirm_yn "确认卸载 realm?"; then
+        info "已取消"
+        return
+    fi
+    systemctl disable --now "$REALM_UNIT" >/dev/null 2>&1
+    rm -f "$REALM_UNIT_FILE" "$REALM_CONF"
+    systemctl daemon-reload
+    # 别的脚本(如 Net-Forwarder)也在用 realm 时,保留二进制
+    if [[ -f /etc/systemd/system/realm.service ]]; then
+        warn "检测到其他 realm.service,保留 $REALM_BIN"
+    else
+        rm -f "$REALM_BIN"
+    fi
+    msg "realm 已卸载"
+    log "REALM uninstalled"
+}
+
+realm_menu() {
+    while true; do
+        clear
+        hr
+        hr_title "realm 管理"
+        hr
+        echo -e "  状态:      $(state_color "$(realm_state)")"
+        echo "  规则:      $(realm_rule_count) 条"
+        echo "  版本:      $(realm_version)"
+        hr_thin
+        echo "  1) 重新应用 realm 规则(重启 realm)"
+        echo "  2) 查看生成的 realm 配置"
+        echo "  3) 查看 realm 日志(最后30行)"
+        echo "  4) 安装 / 更新 realm"
+        echo "  5) 卸载 realm"
+        echo "  0) 返回上级"
+        hr_thin
+        local c
+        read -rp "选择: " c
+        case "$c" in
+            1) rm -f "$REALM_CONF"; apply_realm; pause ;;
+            2) cat "$REALM_CONF" 2>/dev/null || info "暂无(没有 realm 规则)"; pause ;;
+            3) journalctl -u "$REALM_UNIT" -n 30 --no-pager 2>/dev/null; pause ;;
+            4) realm_install; pause ;;
+            5) realm_uninstall; pause ;;
+            0) return ;;
+            *) warn "无效选择"; sleep 1 ;;
+        esac
+    done
 }
 
 # ============ DDNS 更新 ============
@@ -603,9 +914,12 @@ ddns_update() {
     local state_file="$CONF_DIR/.ddns_cache"
     touch "$state_file"
 
-    while IFS='|' read -r id proto lport target rport atype note; do
+    local id proto lport target rport atype note engine
+    while IFS='|' read -r id proto lport target rport atype note engine; do
         [[ "$id" =~ ^[0-9]+$ ]] || continue
         [[ "$atype" == "domain" ]] || continue
+        # realm 自己解析域名,不需要 DDNS
+        [[ "$(rule_engine "$engine")" == "nft" ]] || continue
         local new_ip
         new_ip=$(resolve_domain_v4 "$target")
         if [[ -n "$new_ip" ]]; then
@@ -640,7 +954,7 @@ ddns_update() {
     done < "$RULES_FILE"
 
     if [[ "$need_reload" == "1" ]]; then
-        apply_rules
+        apply_nft
     fi
 }
 
@@ -665,7 +979,7 @@ toggle_ipv6() {
     IPV6_ENABLED="$target_state"
     save_settings
     msg "IPv6 已设置为: $IPV6_ENABLED"
-    apply_rules
+    apply_nft
 }
 
 set_ddns_interval() {
@@ -697,25 +1011,33 @@ set_ddns_interval() {
     msg "DDNS 检查间隔已更新为 $m 分钟"
 }
 
-settings_menu() {
+nft_menu() {
     while true; do
         load_settings
         clear
         hr
-        hr_title "设置"
+        hr_title "nftables 管理"
         hr
-        echo "  当前 IPv6 转发:    $IPV6_ENABLED"
-        echo "  当前 DDNS 间隔:    ${DDNS_INTERVAL_MIN} 分钟"
+        echo -e "  状态:      $(state_color "$(nft_state)")"
+        echo "  规则:      $(nft_rule_count) 条"
+        echo "  IPv6 转发: $IPV6_ENABLED"
+        echo "  DDNS 间隔: ${DDNS_INTERVAL_MIN} 分钟(仅域名规则需要)"
         hr_thin
-        echo "  1) 切换 IPv6 开关"
-        echo "  2) 修改 DDNS 检查间隔"
+        echo "  1) 重新应用 nft 规则"
+        echo "  2) 查看生成的 nft 规则"
+        echo "  3) 切换 IPv6 开关"
+        echo "  4) 修改 DDNS 检查间隔"
         echo "  0) 返回上级"
         hr_thin
         local c
         read -rp "选择: " c
         case "$c" in
-            1) toggle_ipv6; pause ;;
-            2) set_ddns_interval; pause ;;
+            1) apply_nft; pause ;;
+            2) nft list table ip $TABLE4 2>/dev/null || info "未加载"
+               [[ "$IPV6_ENABLED" == "yes" ]] && nft list table ip6 $TABLE6 2>/dev/null
+               pause ;;
+            3) toggle_ipv6; pause ;;
+            4) set_ddns_interval; pause ;;
             0) return ;;
             *) warn "无效选择"; sleep 1 ;;
         esac
@@ -741,6 +1063,7 @@ show_status() {
     else
         echo "  nft-forward-ddns.timer: 未运行"
     fi
+    echo "  ${REALM_UNIT}.service: $(realm_state) (realm $(realm_version), $(realm_rule_count) 条规则)"
     echo ""
     info "当前 nftables 表 ($TABLE4):"
     nft list table ip $TABLE4 2>/dev/null || echo "  (未加载)"
@@ -748,14 +1071,26 @@ show_status() {
 }
 
 # ============ 在线更新 ============
-REPO_URL="https://github.com/merlin-node/nft-forward/archive/refs/heads/main.zip"
+# 下载单个仓库文件到指定路径:直连失败自动走镜像,并校验是 bash 脚本
+fetch_repo_file() {
+    local name="$1" dest="$2" m
+    for m in "${GH_MIRRORS[@]}"; do
+        if http_get "${m}${RAW_BASE}/${name}" > "$dest" 2>/dev/null \
+            && head -1 "$dest" | grep -q '^#!/bin/bash' \
+            && bash -n "$dest" 2>/dev/null; then
+            [[ -n "$m" ]] && info "通过镜像下载: $m"
+            return 0
+        fi
+    done
+    return 1
+}
 
 self_update() {
     echo ""
     hr_title "在线更新 nft-forward" "$CYAN"
     echo ""
     echo "将从 GitHub 拉取最新版本并重新安装:"
-    echo "  $REPO_URL"
+    echo "  $RAW_BASE"
     echo ""
     info "你的规则和设置不会被覆盖"
     echo ""
@@ -764,47 +1099,23 @@ self_update() {
         return
     fi
 
-    # 检查依赖
-    if ! command -v wget >/dev/null 2>&1; then
-        err "未安装 wget,正在安装..."
-        apt-get install -y wget || { err "wget 安装失败"; return 1; }
-    fi
-    if ! command -v unzip >/dev/null 2>&1; then
-        err "未安装 unzip,正在安装..."
-        apt-get install -y unzip || { err "unzip 安装失败"; return 1; }
-    fi
-
     local tmpdir
     tmpdir=$(mktemp -d)
-    cd "$tmpdir" || { err "无法进入临时目录"; return 1; }
 
     msg "下载最新版本..."
-    if ! wget -q --show-progress "$REPO_URL" -O update.zip; then
+    if ! fetch_repo_file install.sh "$tmpdir/install.sh" \
+        || ! fetch_repo_file nft-forward "$tmpdir/nft-forward"; then
         err "下载失败,请检查网络"
         rm -rf "$tmpdir"
         return 1
     fi
 
-    msg "解压..."
-    if ! unzip -q update.zip; then
-        err "解压失败"
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
-    local pkgdir
-    pkgdir=$(find "$tmpdir" -maxdepth 1 -type d -name "nft-forward-*" | head -1)
-    if [[ -z "$pkgdir" ]] || [[ ! -f "$pkgdir/install.sh" ]]; then
-        err "压缩包结构异常,找不到 install.sh"
-        rm -rf "$tmpdir"
-        return 1
-    fi
-
     msg "运行安装脚本..."
-    cd "$pkgdir"
-    bash install.sh
-
-    msg "清理临时文件..."
+    if ! NFT_FORWARD_UPDATE=1 bash "$tmpdir/install.sh"; then
+        err "安装脚本执行失败,当前版本未变"
+        rm -rf "$tmpdir"
+        return 1
+    fi
     rm -rf "$tmpdir"
 
     echo ""
@@ -824,6 +1135,7 @@ self_uninstall() {
     echo "  3. 删除主程序 /usr/local/bin/nft-forward 和短命令 zf"
     echo "  4. 删除自动生成的配置 /etc/nftables-forward.conf"
     echo "  5. 删除 IP 转发设置 /etc/sysctl.d/99-nft-forward.conf"
+    echo "  6. 停止并删除 realm 服务和 realm 程序(若装过)"
     echo ""
     warn "你现有的转发规则会全部失效!"
     echo ""
@@ -845,12 +1157,17 @@ self_uninstall() {
     systemctl stop nft-forward.service 2>/dev/null || true
     systemctl disable nft-forward-ddns.timer 2>/dev/null || true
     systemctl disable nft-forward.service 2>/dev/null || true
+    systemctl disable --now "$REALM_UNIT" 2>/dev/null || true
 
     msg "清除 nftables 表..."
     nft delete table ip $TABLE4 2>/dev/null || true
     nft delete table ip6 $TABLE6 2>/dev/null || true
 
     msg "删除文件..."
+    rm -f "$REALM_UNIT_FILE" "$REALM_CONF"
+    if [[ ! -f /etc/systemd/system/realm.service ]]; then
+        rm -f "$REALM_BIN"
+    fi
     rm -f /etc/systemd/system/nft-forward.service
     rm -f /etc/systemd/system/nft-forward-ddns.service
     rm -f /etc/systemd/system/nft-forward-ddns.timer
@@ -881,40 +1198,72 @@ self_uninstall() {
 }
 
 # ============ 主菜单 ============
+nft_rule_count() {
+    awk -F'|' '$1 ~ /^[0-9]+$/ && $8 != "realm" {n++} END {print n+0}' "$RULES_FILE"
+}
+
+nft_state() {
+    if nft list table ip $TABLE4 >/dev/null 2>&1; then echo "active"; else echo "inactive"; fi
+}
+
+# 状态着色:nft 和 realm 共用
+state_color() {
+    case "$1" in
+        active)     echo -e "${GREEN}运行中${NC}" ;;
+        activating) echo -e "${YELLOW}启动中${NC}" ;;
+        *)          echo -e "${RED}未运行${NC}" ;;
+    esac
+}
+
 menu() {
     while true; do
         clear
-        load_settings
+        local realm_st
+        realm_st=$(state_color "$(realm_state)")
+        [[ -x "$REALM_BIN" ]] || realm_st="${YELLOW}未安装${NC}"
+
         hr
         hr_title "nft-forward 中转管理"
         hr
-        echo "  IPv6: $IPV6_ENABLED   DDNS间隔: ${DDNS_INTERVAL_MIN}分钟"
-        hr_thin
-        echo "  1) 查看规则"
-        echo "  2) 添加规则"
-        echo "  3) 删除规则"
-        echo "  4) 重新应用规则"
-        echo "  5) 立即更新 DDNS"
-        echo "  6) 设置"
-        echo "  7) 查看状态"
-        echo "  8) 查看日志(最后20行)"
-        echo "  9) 卸载本脚本"
-        echo " 10) 在线更新脚本"
+        echo -e "  nftables: $(state_color "$(nft_state)")   规则 $(nft_rule_count) 条"
+        echo -e "  realm:    ${realm_st}   规则 $(realm_rule_count) 条"
+        echo ""
+        echo -e "${YELLOW}  ---- nftables 转发 ----${NC}"
+        echo "  1) 查看 nft 规则"
+        echo "  2) 添加 nft 规则"
+        echo "  3) 删除 nft 规则"
+        echo "  4) nft 管理(应用/IPv6/DDNS)"
+        echo ""
+        echo -e "${YELLOW}  ---- realm 转发 ------${NC}"
+        echo "  5) 查看 realm 规则"
+        echo "  6) 添加 realm 规则"
+        echo "  7) 删除 realm 规则"
+        echo "  8) realm 管理(应用/安装/日志)"
+        echo ""
+        echo -e "${YELLOW}  ---- 脚本 ------------${NC}"
+        echo "  9) 重新应用全部规则"
+        echo " 10) 查看状态"
+        echo " 11) 查看日志(最后20行)"
+        echo " 12) 在线更新脚本"
+        echo " 13) 卸载本脚本"
         echo "  0) 退出脚本"
         hr_thin
         local c
         read -rp "选择: " c
         case "$c" in
-            1) list_rules; pause ;;
-            2) add_rule; pause ;;
-            3) del_rule; pause ;;
-            4) apply_rules; pause ;;
-            5) ddns_update; msg "DDNS 检查完成"; pause ;;
-            6) settings_menu ;;
-            7) show_status; pause ;;
-            8) tail -20 "$LOG_FILE"; pause ;;
-            9) self_uninstall ;;
-            10) self_update ;;
+            1) list_rules nft; pause ;;
+            2) add_rule nft; pause ;;
+            3) del_rule nft; pause ;;
+            4) nft_menu ;;
+            5) list_rules realm; pause ;;
+            6) add_rule realm; pause ;;
+            7) del_rule realm; pause ;;
+            8) realm_menu ;;
+            9) apply_rules; pause ;;
+            10) show_status; pause ;;
+            11) tail -20 "$LOG_FILE"; pause ;;
+            12) self_update ;;
+            13) self_uninstall ;;
             0) echo ""; msg "再见"; exit 0 ;;
             *) warn "无效选择"; sleep 1 ;;
         esac
@@ -930,9 +1279,10 @@ case "${1:-}" in
     ddns)    ddns_update ;;
     list)    list_rules ;;
     status)  show_status ;;
+    realm-install) realm_install ;;
     "")      menu ;;
     *)
-        echo "用法: zf [apply|ddns|list|status]"
+        echo "用法: zf [apply|ddns|list|status|realm-install]"
         echo "无参数进入交互菜单"
         ;;
 esac

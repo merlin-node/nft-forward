@@ -49,6 +49,7 @@ systemctl stop nft-forward-ddns.service 2>/dev/null || true
 systemctl stop nft-forward.service 2>/dev/null || true
 systemctl disable nft-forward-ddns.timer 2>/dev/null || true
 systemctl disable nft-forward.service 2>/dev/null || true
+systemctl disable --now nft-forward-realm.service 2>/dev/null || true
 
 msg "清除 nftables 表..."
 nft delete table ip nft_forward 2>/dev/null || true
@@ -63,6 +64,9 @@ rm -f /usr/local/bin/nft-forward
 rm -f /usr/local/bin/zf
 rm -f /etc/nftables-forward.conf
 rm -f /etc/sysctl.d/99-nft-forward.conf
+rm -f /etc/systemd/system/nft-forward-realm.service /etc/nft-forward/realm.toml
+# 别的脚本也在用 realm 时保留二进制
+[[ -f /etc/systemd/system/realm.service ]] || rm -f /usr/local/bin/realm
 
 systemctl daemon-reload
 
